@@ -110,7 +110,7 @@ class TestOrderedModeAux:
         model.eval()
         with torch.no_grad():
             _, aux = model(x_num, missing_mask, x_cat, x_bin)
-        assert aux["assign"].shape == (BATCH, NUM_NUMERIC, 4)  # num_thresholds=4
+        assert aux["assign"].shape == (BATCH, NUM_NUMERIC, 5)  # num_thresholds+1 = 4+1 = 5
 
     def test_ordered_thresholds_monotone(self, sample_batch):
         x_num, missing_mask, x_cat, x_bin = sample_batch
