@@ -144,17 +144,30 @@ class OrderedThresholdTokenizer(nn.Module):
         delta = softplus(delta_raw) + eps   (always positive)
         thresholds[m, :] = base[m] + cumsum(delta[m, :])
 
-    The soft interval assignment for value x_m is::
+    K thresholds define K+1 intervals.  The gate values and interval
+    membership (assign) for value x_m are::
 
-        h[m, k] = sigmoid((x_m - threshold[m, k]) / temperature)
+        gates[m, k]  = sigmoid((x_m - threshold[m, k]) / temperature)
+                       shape (B, M, K) — monotone in [0, 1]
 
-    This produces a monotone vector in (0,1)^K.  The output token is then a
-    linear projection of h (via per-feature weight matrix W_proj).
+        assign[m, 1]   = 1 - gates[m, 1]
+        assign[m, b]   = gates[m, b-1] - gates[m, b]   for b = 2..K
+        assign[m, K+1] = gates[m, K]
+                         shape (B, M, K+1), sum ≈ 1
+
+    Each interval has a learned embedding e_{m,b} ∈ R^d.  The observed
+    token is the weighted mixture::
+
+        h_m^obs = sum_{b=1}^{K+1} assign[m, b] * bin_emb[m, b]
 
     Missing values are replaced by a dedicated learned embedding.
 
+    Note: temperature is currently a global scalar shared across all
+    features.  A per-feature temperature (shape (M,)) would be a natural
+    extension if finer control per column is needed.
+
     Auxiliary outputs (``aux`` dict)::
-        'assign'     : (B, M, K) soft interval assignment (observation only)
+        'assign'     : (B, M, K+1) interval membership (observation only)
         'thresholds' : (M, K) learned thresholds (detached)
     """
 
@@ -177,13 +190,12 @@ class OrderedThresholdTokenizer(nn.Module):
         self.base = nn.Parameter(torch.zeros(num_features))
         self.delta_raw = nn.Parameter(torch.zeros(num_features, num_thresholds))
 
-        # projection: (M, K, d)
-        self.proj = nn.Parameter(torch.empty(num_features, num_thresholds, d_token))
-        self.proj_bias = nn.Parameter(torch.zeros(num_features, d_token))
+        # per-interval embeddings: (M, K+1, d)
+        self.bin_emb = nn.Parameter(torch.empty(num_features, num_thresholds + 1, d_token))
 
         self.missing_emb = nn.Parameter(torch.empty(num_features, d_token))
 
-        nn.init.normal_(self.proj, std=0.02)
+        nn.init.normal_(self.bin_emb, std=0.02)
         nn.init.normal_(self.missing_emb, std=0.02)
 
     def get_thresholds(self) -> torch.Tensor:
@@ -198,27 +210,37 @@ class OrderedThresholdTokenizer(nn.Module):
         missing_mask: torch.Tensor, # (B, M) bool
     ) -> Tuple[torch.Tensor, Dict]:
         B, M = x_num.shape
-        K = self.num_thresholds
 
         thresholds = self.get_thresholds()  # (M, K)
 
-        # soft interval assignment: (B, M, K)
+        # Step 1: gate values — how much each threshold is exceeded
         # x_num: (B, M, 1)  thresholds: (1, M, K)
         x_exp = x_num.unsqueeze(-1)                              # (B, M, 1)
         thresh_exp = thresholds.unsqueeze(0)                     # (1, M, K)
-        assign = torch.sigmoid((x_exp - thresh_exp) / self.temperature)  # (B, M, K)
+        gates = torch.sigmoid((x_exp - thresh_exp) / self.temperature)  # (B, M, K)
 
-        # project to d_token: assign (B,M,K) x proj (M,K,d) -> (B,M,d)
-        # use einsum: b m k, m k d -> b m d
-        tokens = torch.einsum("bmk,mkd->bmd", assign, self.proj) + self.proj_bias.unsqueeze(0)
+        # Step 2: interval membership α (K+1 bins from K gates)
+        #   α_1     = 1 - g_1
+        #   α_b     = g_{b-1} - g_b   for b = 2..K
+        #   α_{K+1} = g_K
+        # Sum of all α ≈ 1 (exact when sigmoid is exact 0/1; soft otherwise).
+        assign = torch.cat([
+            1 - gates[..., :1],                # (B, M, 1)
+            gates[..., :-1] - gates[..., 1:],  # (B, M, K-1)
+            gates[..., -1:],                   # (B, M, 1)
+        ], dim=-1)  # (B, M, K+1)
 
-        # Replace missing positions
+        # Step 3: mix per-interval embeddings to produce the observed token
+        # assign: (B, M, K+1)  bin_emb: (M, K+1, d)  -> tokens: (B, M, d)
+        tokens = torch.einsum("bmr,mrd->bmd", assign, self.bin_emb)
+
+        # Step 4: replace missing positions with dedicated missing embedding
         miss = self.missing_emb.unsqueeze(0).expand(B, -1, -1)
         mask = missing_mask.unsqueeze(-1).expand_as(tokens)
         tokens = torch.where(mask, miss, tokens)
 
         aux = {
-            "assign": assign,                           # (B, M, K) - raw values including missing positions (not masked)
-            "thresholds": thresholds.detach(),          # (M, K)
+            "assign": assign,                   # (B, M, K+1)
+            "thresholds": thresholds.detach(),  # (M, K)
         }
         return tokens, aux

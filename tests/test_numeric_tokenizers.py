@@ -177,7 +177,7 @@ class TestOrderedThresholdTokenizer:
         x_num, missing_mask = sample_inputs
         tok = OrderedThresholdTokenizer(NUM_FEATURES, D_TOKEN, NUM_THRESHOLDS)
         _, aux = tok(x_num, missing_mask)
-        assert aux["assign"].shape == (BATCH, NUM_FEATURES, NUM_THRESHOLDS)
+        assert aux["assign"].shape == (BATCH, NUM_FEATURES, NUM_THRESHOLDS + 1)
 
     def test_aux_thresholds_shape(self, sample_inputs):
         x_num, missing_mask = sample_inputs
@@ -206,9 +206,43 @@ class TestOrderedThresholdTokenizer:
         assert not torch.isnan(tokens).any()
 
     def test_assign_values_in_0_1(self, sample_inputs):
-        """Soft assignment values should be in [0, 1] (sigmoid output)."""
+        """Interval membership values should be in [0, 1] (differences of monotone sigmoid)."""
         x_num, missing_mask = sample_inputs
         tok = OrderedThresholdTokenizer(NUM_FEATURES, D_TOKEN, NUM_THRESHOLDS)
         _, aux = tok(x_num, missing_mask)
         assign = aux["assign"]
         assert (assign >= 0).all() and (assign <= 1).all()
+
+    def test_assign_sums_to_approximately_one(self, sample_inputs):
+        """Interval memberships should sum to approximately 1 per sample and feature.
+
+        The ``assign`` tensor in aux is computed from gate values before the
+        missing-mask swap, so the sum-to-one property holds for every position
+        (observed *and* missing) in the batch.
+        """
+        x_num, missing_mask = sample_inputs
+        tok = OrderedThresholdTokenizer(NUM_FEATURES, D_TOKEN, NUM_THRESHOLDS)
+        _, aux = tok(x_num, missing_mask)
+        assign = aux["assign"]  # (B, M, K+1)
+        sums = assign.sum(dim=-1)  # (B, M)
+        assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5), (
+            f"assign sums deviate from 1: min={sums.min().item():.6f} max={sums.max().item():.6f}"
+        )
+
+    def test_assign_non_negative(self, sample_inputs):
+        """Interval membership values should be non-negative.
+
+        Kept as a dedicated test (in addition to test_assign_values_in_0_1) to
+        provide an explicit, focused assertion with an informative failure
+        message, as requested by the specification.  In edge cases with extreme
+        temperature values, tiny floating-point negatives are theoretically
+        possible; this test documents that the implementation stays non-negative
+        in normal usage.
+        """
+        x_num, missing_mask = sample_inputs
+        tok = OrderedThresholdTokenizer(NUM_FEATURES, D_TOKEN, NUM_THRESHOLDS)
+        _, aux = tok(x_num, missing_mask)
+        assign = aux["assign"]
+        assert (assign >= 0).all(), (
+            f"assign has negative values: min={assign.min().item():.6f}"
+        )
